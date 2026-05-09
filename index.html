@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>无损图片裁剪工具</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+    body { margin: 0; background: #f7f7fb; color: #222; }
+    .app { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
+    .card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 3px 15px rgba(0,0,0,.06); margin-bottom: 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    button, select, input[type="file"] { padding: 8px 12px; border-radius: 8px; border: 1px solid #d6d8df; background: #fff; }
+    button.primary { background: #2563eb; color: #fff; border-color: #2563eb; cursor: pointer; }
+    .editor-wrap { width: 100%; border: 1px dashed #c8cde0; border-radius: 10px; min-height: 320px; background: #fcfcff; display:flex; justify-content:center; align-items:center; }
+    canvas { max-width: 100%; max-height: 70vh; display: block; }
+    .output { max-width: 100%; border: 1px solid #d7d9e4; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="card">
+      <div class="row">
+        <input id="fileInput" type="file" accept="image/*" />
+        <button id="editBtn" disabled>点击编辑</button>
+        <label>导出比例：
+          <select id="ratioSelect" disabled>
+            <option value="16:9">16:9（导出 1280x720）</option>
+            <option value="9:16">9:16（导出 720x1280）</option>
+          </select>
+        </label>
+        <button id="cropBtn" class="primary" disabled>裁剪并生成新图</button>
+        <button id="downloadBtn" disabled>导出图片</button>
+      </div>
+      <div>编辑区会完整显示整张图（无滚动条）；导出分辨率固定为 720p（横版1280x720 / 竖版720x1280）。</div>
+    </div>
+    <div class="card"><div class="editor-wrap"><canvas id="canvas"></canvas></div></div>
+    <div class="card"><img id="resultImage" class="output" alt="裁剪结果" /></div>
+  </div>
+<script>
+const fileInput = document.getElementById('fileInput');
+const editBtn = document.getElementById('editBtn');
+const ratioSelect = document.getElementById('ratioSelect');
+const cropBtn = document.getElementById('cropBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const resultImage = document.getElementById('resultImage');
+let imageBitmap = null, editing = false, dragging = false, dragStart = null, selection = null, exportBlob = null;
+
+function pointerPos(evt) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: (evt.clientX - rect.left) * (canvas.width / rect.width), y: (evt.clientY - rect.top) * (canvas.height / rect.height) };
+}
+function normalizeRect(x1,y1,x2,y2){ const x=Math.max(0,Math.min(x1,x2)); const y=Math.max(0,Math.min(y1,y2)); return {x:Math.round(x),y:Math.round(y),w:Math.round(Math.min(canvas.width,Math.max(x1,x2))-x),h:Math.round(Math.min(canvas.height,Math.max(y1,y2))-y)}; }
+function fitRectToRatio(rect, ratio){ const [rw,rh]=ratio.split(':').map(Number); const t=rw/rh; let {x,y,w,h}=rect; const c=w/h; if(c>t){ const nw=Math.round(h*t); x+=Math.round((w-nw)/2); w=nw;} else if(c<t){ const nh=Math.round(w/t); y+=Math.round((h-nh)/2); h=nh;} return {x,y,w,h}; }
+function draw(){ if(!imageBitmap) return; ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(imageBitmap,0,0); if(selection){ const {x,y,w,h}=selection; ctx.save(); ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(0,0,canvas.width,canvas.height); ctx.clearRect(x,y,w,h); ctx.strokeStyle='#2563eb'; ctx.lineWidth=2; ctx.strokeRect(x+0.5,y+0.5,w,h); ctx.restore(); }}
+
+fileInput.addEventListener('change', async (e)=>{ const f=e.target.files?.[0]; if(!f) return; imageBitmap=await createImageBitmap(f); canvas.width=imageBitmap.width; canvas.height=imageBitmap.height; selection={x:0,y:0,w:canvas.width,h:canvas.height}; draw(); editBtn.disabled=false; ratioSelect.disabled=false; cropBtn.disabled=false; downloadBtn.disabled=true; exportBlob=null; resultImage.removeAttribute('src');});
+editBtn.addEventListener('click',()=>{ editing=true; editBtn.textContent='编辑中（拖动框选）';});
+canvas.addEventListener('pointerdown',(e)=>{ if(!editing||!imageBitmap)return; dragging=true; dragStart=pointerPos(e); selection={x:dragStart.x,y:dragStart.y,w:1,h:1}; draw(); });
+canvas.addEventListener('pointermove',(e)=>{ if(!dragging||!dragStart)return; const p=pointerPos(e); selection=normalizeRect(dragStart.x,dragStart.y,p.x,p.y); draw();});
+window.addEventListener('pointerup',()=>{ if(!dragging)return; dragging=false; if(selection&&(selection.w<2||selection.h<2)) selection=null; draw(); });
+
+cropBtn.addEventListener('click', async ()=>{
+  if(!selection||!imageBitmap) return alert('请先框选有效区域');
+  const ratio=ratioSelect.value;
+  const rect=fitRectToRatio(selection,ratio);
+  const out=document.createElement('canvas');
+  if(ratio==='16:9'){ out.width=1280; out.height=720; } else { out.width=720; out.height=1280; }
+  out.getContext('2d').drawImage(imageBitmap, rect.x, rect.y, rect.w, rect.h, 0, 0, out.width, out.height);
+  exportBlob=await new Promise(r=>out.toBlob(r,'image/png'));
+  resultImage.src=URL.createObjectURL(exportBlob);
+  downloadBtn.disabled=false;
+});
+
+downloadBtn.addEventListener('click',()=>{ if(!exportBlob) return; const a=document.createElement('a'); a.href=URL.createObjectURL(exportBlob); a.download=`cropped-${Date.now()}.png`; a.click();});
+</script>
+</body>
+</html>
