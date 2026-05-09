@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>无损图片裁剪工具</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif; }
+    body { margin: 0; background: #f7f7fb; color: #222; }
+    .app { max-width: 980px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 26px; margin-bottom: 8px; }
+    .card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 3px 15px rgba(0,0,0,.06); margin-bottom: 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    button, select, input[type="file"] { padding: 8px 12px; border-radius: 8px; border: 1px solid #d6d8df; background: #fff; }
+    button { cursor: pointer; }
+    button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .hint { color: #666; font-size: 14px; margin-top: 8px; }
+    .editor-wrap { position: relative; width: 100%; overflow: auto; border: 1px dashed #c8cde0; border-radius: 10px; min-height: 220px; background: #fcfcff; }
+    canvas { display: block; max-width: none; }
+    .output { max-width: 100%; border: 1px solid #d7d9e4; border-radius: 10px; }
+    .pill { background: #eef2ff; color: #334155; border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <h1>无损图片裁剪工具</h1>
+    <div class="card">
+      <div class="row">
+        <input id="fileInput" type="file" accept="image/*" />
+        <button id="editBtn" disabled>点击编辑</button>
+        <label>导出比例：
+          <select id="ratioSelect" disabled>
+            <option value="none">保持所选区域比例</option>
+            <option value="16:9">16:9（横图）</option>
+            <option value="9:16">9:16（竖图）</option>
+          </select>
+        </label>
+        <button id="cropBtn" class="primary" disabled>裁剪并生成新图</button>
+        <button id="downloadBtn" disabled>导出图片</button>
+      </div>
+      <div class="hint">说明：上传后点击“编辑”，在图片上拖动框选矩形区域。导出阶段会在不拉伸的前提下适配到目标比例（16:9 或 9:16），多余区域自动裁掉。</div>
+    </div>
+
+    <div class="card">
+      <div class="row"><span class="pill">编辑区域</span></div>
+      <div class="editor-wrap">
+        <canvas id="canvas"></canvas>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row"><span class="pill">裁剪结果</span></div>
+      <img id="resultImage" class="output" alt="裁剪结果" />
+    </div>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const editBtn = document.getElementById('editBtn');
+    const ratioSelect = document.getElementById('ratioSelect');
+    const cropBtn = document.getElementById('cropBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const resultImage = document.getElementById('resultImage');
+
+    let imageBitmap = null;
+    let editing = false;
+    let dragging = false;
+    let dragStart = null;
+    let selection = null;
+    let exportBlob = null;
+
+    function draw() {
+      if (!imageBitmap) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        return;
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(imageBitmap, 0, 0);
+
+      if (selection) {
+        const { x, y, w, h } = selection;
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.clearRect(x, y, w, h);
+
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+        ctx.restore();
+      }
+    }
+
+    function normalizeRect(x1, y1, x2, y2) {
+      const x = Math.max(0, Math.min(x1, x2));
+      const y = Math.max(0, Math.min(y1, y2));
+      const w = Math.min(canvas.width, Math.max(x1, x2)) - x;
+      const h = Math.min(canvas.height, Math.max(y1, y2)) - y;
+      return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+    }
+
+    function pointerPos(evt) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (evt.clientX - rect.left) * (canvas.width / rect.width),
+        y: (evt.clientY - rect.top) * (canvas.height / rect.height),
+      };
+    }
+
+    function fitRectToRatio(rect, ratio) {
+      if (!ratio || ratio === 'none') return rect;
+      const [rw, rh] = ratio.split(':').map(Number);
+      const target = rw / rh;
+      let { x, y, w, h } = rect;
+      const current = w / h;
+
+      if (current > target) {
+        // too wide -> trim width
+        const newW = Math.round(h * target);
+        x += Math.round((w - newW) / 2);
+        w = newW;
+      } else if (current < target) {
+        // too tall -> trim height
+        const newH = Math.round(w / target);
+        y += Math.round((h - newH) / 2);
+        h = newH;
+      }
+      return { x, y, w, h };
+    }
+
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const bmp = await createImageBitmap(file);
+      imageBitmap = bmp;
+      canvas.width = bmp.width;
+      canvas.height = bmp.height;
+      selection = { x: 0, y: 0, w: bmp.width, h: bmp.height };
+      editing = false;
+      draw();
+
+      editBtn.disabled = false;
+      ratioSelect.disabled = false;
+      cropBtn.disabled = false;
+      downloadBtn.disabled = true;
+      resultImage.removeAttribute('src');
+      exportBlob = null;
+    });
+
+    editBtn.addEventListener('click', () => {
+      if (!imageBitmap) return;
+      editing = true;
+      editBtn.textContent = '编辑中（拖动框选）';
+    });
+
+    canvas.addEventListener('pointerdown', (evt) => {
+      if (!editing || !imageBitmap) return;
+      dragging = true;
+      dragStart = pointerPos(evt);
+      const p = dragStart;
+      selection = { x: Math.round(p.x), y: Math.round(p.y), w: 1, h: 1 };
+      draw();
+    });
+
+    canvas.addEventListener('pointermove', (evt) => {
+      if (!dragging || !dragStart) return;
+      const p = pointerPos(evt);
+      selection = normalizeRect(dragStart.x, dragStart.y, p.x, p.y);
+      draw();
+    });
+
+    window.addEventListener('pointerup', () => {
+      if (!dragging) return;
+      dragging = false;
+      dragStart = null;
+      if (selection && (selection.w < 2 || selection.h < 2)) selection = null;
+      draw();
+    });
+
+    cropBtn.addEventListener('click', async () => {
+      if (!imageBitmap || !selection) {
+        alert('请先在编辑区域框选一个有效矩形。');
+        return;
+      }
+      const ratio = ratioSelect.value;
+      const cropRect = fitRectToRatio(selection, ratio);
+      if (cropRect.w < 1 || cropRect.h < 1) {
+        alert('所选区域过小，请重新选择。');
+        return;
+      }
+
+      const outCanvas = document.createElement('canvas');
+      outCanvas.width = cropRect.w;
+      outCanvas.height = cropRect.h;
+      const outCtx = outCanvas.getContext('2d');
+      outCtx.drawImage(
+        imageBitmap,
+        cropRect.x, cropRect.y, cropRect.w, cropRect.h,
+        0, 0, cropRect.w, cropRect.h
+      );
+
+      exportBlob = await new Promise((resolve) => outCanvas.toBlob(resolve, 'image/png'));
+      resultImage.src = URL.createObjectURL(exportBlob);
+      downloadBtn.disabled = false;
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      if (!exportBlob) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(exportBlob);
+      a.download = `cropped-${Date.now()}.png`;
+      a.click();
+    });
+  </script>
+</body>
+</html>
