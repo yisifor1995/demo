@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>无损图片裁剪工具</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+    body { margin: 0; background: #f7f7fb; color: #222; }
+    .app { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
+    .card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 3px 15px rgba(0,0,0,.06); margin-bottom: 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    button, select, input[type="file"] { padding: 8px 12px; border-radius: 8px; border: 1px solid #d6d8df; background: #fff; }
+    button.primary { background: #2563eb; color: #fff; border-color: #2563eb; cursor: pointer; }
+    .editor-wrap { width: 100%; border: 1px dashed #c8cde0; border-radius: 10px; min-height: 420px; background: #fcfcff; overflow: hidden; position: relative; touch-action: none; }
+    canvas { display: block; width: 100%; height: 70vh; max-height: 760px; cursor: crosshair; }
+    .hint { font-size: 13px; color: #555; }
+    .output { max-width: 100%; border: 1px solid #d7d9e4; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="card">
+      <div class="row">
+        <input id="fileInput" type="file" accept="image/*" />
+        <button id="editBtn" disabled>点击编辑（框选）</button>
+        <button id="panBtn" disabled>拖拽移动视图</button>
+        <button id="zoomInBtn" disabled>放大 +</button>
+        <button id="zoomOutBtn" disabled>缩小 -</button>
+        <button id="resetViewBtn" disabled>重置视图</button>
+        <label>导出比例：
+          <select id="ratioSelect" disabled>
+            <option value="16:9">16:9（导出 1280x720）</option>
+            <option value="9:16">9:16（导出 720x1280）</option>
+          </select>
+        </label>
+        <button id="cropBtn" class="primary" disabled>裁剪并生成新图</button>
+        <button id="downloadBtn" disabled>导出图片</button>
+      </div>
+      <div class="hint">支持滚轮缩放、拖拽移动视图；编辑模式下拖动可框选裁剪区域。导出固定 720p（横版1280x720 / 竖版720x1280）。</div>
+    </div>
+    <div class="card"><div class="editor-wrap"><canvas id="canvas"></canvas></div></div>
+    <div class="card"><img id="resultImage" class="output" alt="裁剪结果" /></div>
+  </div>
+<script>
+const $ = (id) => document.getElementById(id);
+const fileInput = $('fileInput'), editBtn = $('editBtn'), panBtn = $('panBtn');
+const zoomInBtn = $('zoomInBtn'), zoomOutBtn = $('zoomOutBtn'), resetViewBtn = $('resetViewBtn');
+const ratioSelect = $('ratioSelect'), cropBtn = $('cropBtn'), downloadBtn = $('downloadBtn');
+const canvas = $('canvas'), ctx = canvas.getContext('2d'), resultImage = $('resultImage');
+
+const state = {
+  image: null, exportBlob: null, mode: 'select',
+  view: { scale: 1, minScale: 1, maxScale: 8, offsetX: 0, offsetY: 0 },
+  drag: { panning: false, selecting: false, startX: 0, startY: 0 },
+  selection: null,
+};
+
+function setCanvasSize() {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(rect.width * dpr));
+  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function imageToScreen(x, y) {
+  return { x: x * state.view.scale + state.view.offsetX, y: y * state.view.scale + state.view.offsetY };
+}
+function screenToImage(x, y) {
+  return { x: (x - state.view.offsetX) / state.view.scale, y: (y - state.view.offsetY) / state.view.scale };
+}
+
+function clampView() {
+  if (!state.image) return;
+  const vw = canvas.clientWidth, vh = canvas.clientHeight;
+  const iw = state.image.width * state.view.scale, ih = state.image.height * state.view.scale;
+  const minX = Math.min(0, vw - iw), maxX = Math.max(0, vw - iw);
+  const minY = Math.min(0, vh - ih), maxY = Math.max(0, vh - ih);
+  state.view.offsetX = Math.min(maxX, Math.max(minX, state.view.offsetX));
+  state.view.offsetY = Math.min(maxY, Math.max(minY, state.view.offsetY));
+}
+
+function normalizeRect(p1, p2) {
+  const x = Math.max(0, Math.min(p1.x, p2.x));
+  const y = Math.max(0, Math.min(p1.y, p2.y));
+  const x2 = Math.min(state.image.width, Math.max(p1.x, p2.x));
+  const y2 = Math.min(state.image.height, Math.max(p1.y, p2.y));
+  return { x: Math.round(x), y: Math.round(y), w: Math.round(x2 - x), h: Math.round(y2 - y) };
+}
+
+function fitRectToRatio(rect, ratio){ const [rw,rh]=ratio.split(':').map(Number); const t=rw/rh; let {x,y,w,h}=rect; const c=w/h; if(c>t){ const nw=Math.round(h*t); x+=Math.round((w-nw)/2); w=nw;} else if(c<t){ const nh=Math.round(w/t); y+=Math.round((h-nh)/2); h=nh;} return {x,y,w,h}; }
+
+function draw() {
+  if (!state.image) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  ctx.save();
+  ctx.translate(state.view.offsetX, state.view.offsetY);
+  ctx.scale(state.view.scale, state.view.scale);
+  ctx.drawImage(state.image, 0, 0);
+  ctx.restore();
+
+  if (state.selection) {
+    const { x, y, w: sw, h: sh } = state.selection;
+    const p = imageToScreen(x, y), p2 = imageToScreen(x + sw, y + sh);
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 0, w, h);
+    ctx.clearRect(p.x, p.y, p2.x - p.x, p2.y - p.y);
+    ctx.strokeStyle = '#2563eb';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(p.x + 0.5, p.y + 0.5, p2.x - p.x, p2.y - p.y);
+    ctx.restore();
+  }
+}
+
+function resetView() {
+  if (!state.image) return;
+  const vw = canvas.clientWidth, vh = canvas.clientHeight;
+  const sx = vw / state.image.width, sy = vh / state.image.height;
+  state.view.minScale = Math.min(sx, sy);
+  state.view.scale = state.view.minScale;
+  state.view.offsetX = (vw - state.image.width * state.view.scale) / 2;
+  state.view.offsetY = (vh - state.image.height * state.view.scale) / 2;
+  draw();
+}
+
+function zoomAt(clientX, clientY, factor) {
+  const rect = canvas.getBoundingClientRect();
+  const sx = clientX - rect.left, sy = clientY - rect.top;
+  const before = screenToImage(sx, sy);
+  state.view.scale = Math.max(state.view.minScale, Math.min(state.view.maxScale, state.view.scale * factor));
+  state.view.offsetX = sx - before.x * state.view.scale;
+  state.view.offsetY = sy - before.y * state.view.scale;
+  clampView(); draw();
+}
+
+fileInput.addEventListener('change', async (e) => {
+  const f = e.target.files?.[0]; if (!f) return;
+  state.image = await createImageBitmap(f);
+  state.selection = { x: 0, y: 0, w: state.image.width, h: state.image.height };
+  [editBtn, panBtn, zoomInBtn, zoomOutBtn, resetViewBtn, ratioSelect, cropBtn].forEach(el => el.disabled = false);
+  downloadBtn.disabled = true; state.exportBlob = null; resultImage.removeAttribute('src');
+  setCanvasSize(); resetView();
+});
+
+editBtn.addEventListener('click', () => { state.mode = 'select'; canvas.style.cursor = 'crosshair'; });
+panBtn.addEventListener('click', () => { state.mode = 'pan'; canvas.style.cursor = 'grab'; });
+zoomInBtn.addEventListener('click', () => zoomAt(canvas.getBoundingClientRect().left + canvas.clientWidth / 2, canvas.getBoundingClientRect().top + canvas.clientHeight / 2, 1.25));
+zoomOutBtn.addEventListener('click', () => zoomAt(canvas.getBoundingClientRect().left + canvas.clientWidth / 2, canvas.getBoundingClientRect().top + canvas.clientHeight / 2, 0.8));
+resetViewBtn.addEventListener('click', resetView);
+
+canvas.addEventListener('wheel', (e) => {
+  if (!state.image) return;
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.1 : 0.9);
+}, { passive: false });
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (!state.image) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  if (state.mode === 'pan') {
+    state.drag.panning = true; state.drag.startX = sx; state.drag.startY = sy; canvas.style.cursor = 'grabbing';
+  } else {
+    state.drag.selecting = true;
+    const p = screenToImage(sx, sy);
+    state.drag.startX = p.x; state.drag.startY = p.y;
+    state.selection = { x: Math.round(p.x), y: Math.round(p.y), w: 1, h: 1 };
+  }
+  draw();
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!state.image) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  if (state.drag.panning) {
+    state.view.offsetX += sx - state.drag.startX;
+    state.view.offsetY += sy - state.drag.startY;
+    state.drag.startX = sx; state.drag.startY = sy;
+    clampView(); draw();
+  } else if (state.drag.selecting) {
+    const p = screenToImage(sx, sy);
+    state.selection = normalizeRect({ x: state.drag.startX, y: state.drag.startY }, p);
+    draw();
+  }
+});
+window.addEventListener('pointerup', () => {
+  state.drag.panning = false;
+  if (state.mode === 'pan') canvas.style.cursor = 'grab';
+  state.drag.selecting = false;
+  if (state.selection && (state.selection.w < 2 || state.selection.h < 2)) state.selection = null;
+  draw();
+});
+
+cropBtn.addEventListener('click', async () => {
+  if (!state.selection || !state.image) return alert('请先框选有效区域');
+  const rect = fitRectToRatio(state.selection, ratioSelect.value);
+  const out = document.createElement('canvas');
+  if (ratioSelect.value === '16:9') { out.width = 1280; out.height = 720; } else { out.width = 720; out.height = 1280; }
+  out.getContext('2d').drawImage(state.image, rect.x, rect.y, rect.w, rect.h, 0, 0, out.width, out.height);
+  state.exportBlob = await new Promise(r => out.toBlob(r, 'image/png'));
+  resultImage.src = URL.createObjectURL(state.exportBlob);
+  downloadBtn.disabled = false;
+});
+
+downloadBtn.addEventListener('click', () => {
+  if (!state.exportBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(state.exportBlob);
+  a.download = `cropped-${Date.now()}.png`;
+  a.click();
+});
+
+window.addEventListener('resize', () => {
+  if (!state.image) return;
+  setCanvasSize();
+  clampView();
+  draw();
+});
+</script>
+</body>
+</html>
